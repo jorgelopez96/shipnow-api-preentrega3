@@ -1,5 +1,5 @@
+import { AppError } from '../errors/app-error.js';
 import { usersRepository } from '../repositories/users.repository.js';
-import { AppError } from '../utils/app-error.js';
 import { hashPassword } from '../utils/password.js';
 
 export const usersService = {
@@ -7,12 +7,15 @@ export const usersService = {
 
   async getById(id) {
     const user = await usersRepository.findById(id);
-    if (!user) throw new AppError('Usuario no encontrado', 404);
+    if (!user) throw new AppError('USER_NOT_FOUND');
     return user;
   },
 
   async create({ firstName, lastName, email, password, role, isAvailable }) {
-    if (!password) throw new AppError('La contraseña es obligatoria', 400);
+    if (!password) throw new AppError('PASSWORD_REQUIRED');
+    if (email && (await usersRepository.findByEmail(email))) {
+      throw new AppError('USER_ALREADY_EXISTS', { details: `Email: ${email}` });
+    }
     return usersRepository.create({
       firstName,
       lastName,

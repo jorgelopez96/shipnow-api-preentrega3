@@ -2,7 +2,7 @@
 
 API de una plataforma de logística hecha con **Node.js**, **Express** (ES Modules) y **MongoDB + Mongoose**.
 
-Esta entrega (pre-entrega del Módulo 2) suma un **módulo de mocking** para generar usuarios, repartidores, pedidos y entregas de prueba sin cargarlos a mano, respetando la arquitectura por capas.
+Esta entrega (pre-entrega del Módulo 3) suma un **manejo profesional de errores**: errores personalizados del dominio, un diccionario de errores y un middleware global que responde todos los errores con el mismo formato. Se aplica a toda la API, incluido el módulo de mocking de la entrega anterior.
 
 ## Instalación
 
@@ -37,7 +37,7 @@ npm start     # node server.js
 ```
 server.js              Conecta a MongoDB y levanta el servidor
 src/
-├── app.js             Express, routers y middleware de errores
+├── app.js             Express, routers y middleware de errores (siempre al final)
 ├── config/            Variables de entorno validadas
 ├── constants/         Roles, estados, prioridades y límites
 ├── routes/            Solo definen rutas y delegan al controller
@@ -46,7 +46,9 @@ src/
 ├── repositories/      Única capa que habla con Mongoose
 ├── models/            Schemas de User, Order y Delivery
 ├── mocks/             Generadores de datos falsos con @faker-js/faker (locale es)
-└── utils/             Error de app, middleware de errores, hash de contraseñas, total del pedido
+├── errors/            Diccionario de errores y clase AppError
+├── middlewares/       Middleware global de errores y de rutas inexistentes
+└── utils/             Hash de contraseñas y total del pedido
 ```
 
 Flujo: **Router → Controller → Service → Repository → Model**. Ninguna capa se saltea a otra.
@@ -150,10 +152,7 @@ Respuesta (`201`):
 
 **Cómo se insertan:** primero los usuarios (rol `customer`) y los repartidores (rol `driver`). Después los pedidos, cada uno con uno de esos clientes recién creados. Por último las entregas: cada una va asociada a uno de esos pedidos y, cuando corresponde, a un repartidor recién creado.
 
-**Validaciones (responden `400` con un mensaje claro):**
-
-- Cada cantidad tiene que ser un entero entre 0 y 100 (`MAX_MOCK_ITEMS`), y al menos una tiene que ser mayor a 0.
-- Para generar pedidos hace falta generar usuarios. Para generar entregas hacen falta pedidos y repartidores.
+**Validaciones:** cada cantidad tiene que ser un entero entre 0 y 100 (`MAX_MOCK_ITEMS`) y al menos una tiene que ser mayor a 0. Para generar pedidos hacen falta usuarios, y para generar entregas hacen falta pedidos y repartidores. Si la carga en MongoDB falla a mitad de camino, se borra lo que ya se había insertado en ese seed. Los códigos de cada caso están en la sección [Errores](#errores).
 
 ## Reglas de los datos generados
 
@@ -171,12 +170,81 @@ Respuesta (`201`):
 | --------- | ------------------------------------------ | --------------------------------------------------------------------------- |
 | GET/POST  | `/api/users`, `/api/users/:id`             | Listar, ver y crear usuarios (la contraseña se hashea)                      |
 | GET/POST  | `/api/orders`, `/api/orders/:id`           | Pedidos. El total se calcula desde los items y el cliente tiene que existir |
-| GET/POST  | `/api/deliveries`, `/api/deliveries/:id`   | Entregas. El pedido tiene que existir y el repartidor tener rol `driver`    |
+| PATCH     | `/api/orders/:id/status`                   | Cambia el estado (`{ "status": "in_transit" }`). Un pedido entregado o cancelado ya no cambia |
+| GET/POST  | `/api/deliveries`, `/api/deliveries/:id`   | Entregas. El pedido tiene que existir y el repartidor tener rol `driver` y estar disponible |
 
 ## Errores
 
-Todos los errores pasan por un middleware central y responden con el mismo formato:
+Ninguna ruta ni controller responde errores por su cuenta. Cada capa detecta el problema y lanza un `AppError` con un código del diccionario. Por ejemplo, el service lanza `new AppError('ORDER_NOT_FOUND')`, el controller lo deriva con `next(error)` y la respuesta la arma únicamente el middleware global (`src/middlewares/error.middleware.js`).
+
+### Estructura de la respuesta
 
 ```json
-{ "status": "error", "message": "\"qty\" debe ser un número entero entre 0 y 100" }
+{
+  "status": "error",
+  "statusCode": 404,
+  "error": "ORDER_NOT_FOUND",
+  "message": "No se encontró el pedido solicitado"
+}
 ```
+
+- `statusCode`: el mismo status HTTP de la respuesta.
+- `error`: código estable para usar desde el frontend, los tests o la documentación.
+- `message`: explicación para el cliente.
+- `details`: información extra para depurar. Solo aparece si `NODE_ENV` no es `production`.
+
+El middleware también traduce los errores que no son `AppError`: validaciones de Mongoose (`VALIDATION_ERROR`), IDs mal formados (`INVALID_ID`), JSON roto (`INVALID_JSON`), claves duplicadas (`DUPLICATE_VALUE`) y fallas de MongoDB (`DATABASE_ERROR`). Cualquier otro error inesperado responde `INTERNAL_SERVER_ERROR` sin exponer detalles internos, y los errores 500 se registran por consola.
+
+### Diccionario de errores
+
+Está en `src/errors/error-dictionary.js`.
+
+| Código                      | HTTP | Cuándo                                                               |
+| --------------------------- | ---- | -------------------------------------------------------------------- |
+| `VALIDATION_ERROR`          | 400  | Faltan datos obligatorios o tienen un valor inválido                 |
+| `INVALID_ID`                | 400  | El ID no tiene formato de ObjectId                                   |
+| `INVALID_JSON`              | 400  | El body no es un JSON válido                                         |
+| `ROUTE_NOT_FOUND`           | 404  | La ruta no existe                                                    |
+| `DUPLICATE_VALUE`           | 409  | Se viola un índice único                                             |
+| `USER_NOT_FOUND`            | 404  | El usuario (o el cliente del pedido) no existe                       |
+| `USER_ALREADY_EXISTS`       | 409  | Ya hay un usuario con ese email                                      |
+| `PASSWORD_REQUIRED`         | 400  | Se crea un usuario sin contraseña                                    |
+| `ORDER_NOT_FOUND`           | 404  | El pedido no existe                                                  |
+| `ORDER_ITEMS_REQUIRED`      | 400  | El pedido no tiene items                                             |
+| `INVALID_ORDER_STATUS`      | 400  | El estado no es uno de `ORDER_STATUS`                                |
+| `ORDER_ALREADY_CLOSED`      | 409  | Se intenta cambiar el estado de un pedido entregado o cancelado      |
+| `DELIVERY_NOT_FOUND`        | 404  | La entrega no existe                                                 |
+| `DRIVER_NOT_FOUND`          | 404  | El repartidor no existe o no tiene rol `driver`                      |
+| `DRIVER_NOT_AVAILABLE`      | 409  | El repartidor tiene `isAvailable: false`                             |
+| `INVALID_MOCK_AMOUNT`       | 400  | La cantidad no es un entero, es negativa o es 0                      |
+| `MOCK_LIMIT_EXCEEDED`       | 400  | La cantidad supera `MAX_MOCK_ITEMS` (100)                            |
+| `MOCK_DEPENDENCIES_MISSING` | 400  | Se piden pedidos sin usuarios, o entregas sin pedidos o repartidores |
+| `MOCK_GENERATION_ERROR`     | 500  | Falló la carga en MongoDB. Se deshace lo insertado                   |
+| `DATABASE_ERROR`            | 500  | MongoDB no responde                                                  |
+| `INTERNAL_SERVER_ERROR`     | 500  | Error inesperado                                                     |
+
+### Cómo probar los casos inválidos
+
+Con la API corriendo en desarrollo (`npm run dev`):
+
+```bash
+# Mocks
+curl "http://localhost:8080/api/mocks/users?qty=abc"        # 400 INVALID_MOCK_AMOUNT (no es un número)
+curl "http://localhost:8080/api/mocks/users?qty=-5"         # 400 INVALID_MOCK_AMOUNT (negativo)
+curl "http://localhost:8080/api/mocks/orders?qty=0"         # 400 INVALID_MOCK_AMOUNT (tiene que ser mayor a 0)
+curl "http://localhost:8080/api/mocks/drivers?qty=500"      # 400 MOCK_LIMIT_EXCEEDED
+curl -X POST http://localhost:8080/api/mocks/seed           # 400 INVALID_MOCK_AMOUNT (sin cantidades)
+curl -X POST http://localhost:8080/api/mocks/seed -H "Content-Type: application/json" -d '{"users":-1}'  # 400 INVALID_MOCK_AMOUNT
+curl -X POST http://localhost:8080/api/mocks/seed -H "Content-Type: application/json" -d '{"orders":3}'  # 400 MOCK_DEPENDENCIES_MISSING
+curl -X POST http://localhost:8080/api/mocks/seed -H "Content-Type: application/json" -d '{users:'       # 400 INVALID_JSON
+
+# Usuarios, pedidos y entregas
+curl http://localhost:8080/api/users/abc                         # 400 INVALID_ID
+curl http://localhost:8080/api/users/507f1f77bcf86cd799439011    # 404 USER_NOT_FOUND
+curl -X POST http://localhost:8080/api/orders -H "Content-Type: application/json" \
+  -d '{"customer":"507f1f77bcf86cd799439011","items":[{"name":"Caja","quantity":1,"price":10}],"deliveryAddress":"Calle 1"}'  # 404 USER_NOT_FOUND
+curl -X PATCH http://localhost:8080/api/orders/<id>/status -H "Content-Type: application/json" -d '{"status":"on_the_way"}'  # 400 INVALID_ORDER_STATUS
+curl http://localhost:8080/api/ruta-que-no-existe                # 404 ROUTE_NOT_FOUND
+```
+
+**Falla de MongoDB durante el seed:** con la API corriendo, detené MongoDB (en Windows, `net stop MongoDB` como administrador) y ejecutá `curl -X POST "http://localhost:8080/api/mocks/seed?qty=5"`. Después de unos segundos responde `500 MOCK_GENERATION_ERROR` en lugar de romperse. Si la falla ocurre a mitad de la carga, el seed borra lo que ya había insertado para no dejar datos a medias.

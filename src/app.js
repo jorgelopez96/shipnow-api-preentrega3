@@ -4,7 +4,7 @@ import deliveriesRouter from './routes/deliveries.router.js';
 import mocksRouter from './routes/mocks.router.js';
 import ordersRouter from './routes/orders.router.js';
 import usersRouter from './routes/users.router.js';
-import { errorHandler, notFoundHandler } from './utils/error-handler.js';
+import { errorHandler, notFoundHandler } from './middlewares/error.middleware.js';
 
 const app = express();
 

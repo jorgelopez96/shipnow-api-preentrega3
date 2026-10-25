@@ -24,4 +24,12 @@ export const ordersController = {
       next(error);
     }
   },
+
+  async updateStatus(req, res, next) {
+    try {
+      res.json(await ordersService.updateStatus(req.params.id, req.body?.status));
+    } catch (error) {
+      next(error);
+    }
+  },
 };
